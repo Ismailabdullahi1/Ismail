@@ -1,109 +1,142 @@
 
-import json
 import os
+import json
+import base64
 import urllib.request
 from collections import defaultdict
+from urllib.error import HTTPError
 
-TOKEN = os.environ["GH_STATS_TOKEN"]
 USERNAME = os.environ["GH_USERNAME"]
+READ_TOKEN = os.environ["GH_STATS_TOKEN"]
+WRITE_TOKEN = os.environ["PROFILE_TOKEN"]
 
-HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28"
-}
+PROFILE_REPO = USERNAME
+EXCLUDED_REPOS = {"Ismail", PROFILE_REPO}
 
-def github_api(url):
-    request = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(request) as response:
+API = "https://api.github.com"
+
+def request(url, token, method="GET", data=None):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+    body = None
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(data).encode()
+
+    req = urllib.request.Request(
+        url, data=body, headers=headers, method=method
+    )
+
+    with urllib.request.urlopen(req) as response:
         return json.loads(response.read())
 
-# Get all repositories owned by the account
+# 1. Fetch all repositories owned by the account
 repositories = []
 page = 1
 
 while True:
     url = (
-        f"https://api.github.com/user/repos"
+        f"{API}/user/repos"
         f"?visibility=all&affiliation=owner"
         f"&per_page=100&page={page}"
     )
 
-    batch = github_api(url)
+    batch = request(url, READ_TOKEN)
 
     if not batch:
         break
 
     repositories.extend(batch)
+
+    if len(batch) < 100:
+        break
+
     page += 1
 
-# Aggregate language bytes across repositories
+# 2. Calculate language usage
 totals = defaultdict(int)
 
 for repo in repositories:
+    if repo["name"] in EXCLUDED_REPOS:
+        continue
+
     if repo["fork"] or repo["archived"]:
         continue
 
-    url = (
-        f"https://api.github.com/repos/"
-        f"{USERNAME}/{repo['name']}/languages"
+    languages = request(
+        f"{API}/repos/{repo['full_name']}/languages",
+        READ_TOKEN
     )
-
-    languages = github_api(url)
 
     for language, size in languages.items():
         totals[language] += size
 
-# Sort by total bytes
-sorted_languages = sorted(
-    totals.items(),
-    key=lambda item: item[1],
-    reverse=True
-)
-
 total_bytes = sum(totals.values())
 
-if not total_bytes:
-    raise RuntimeError("No language statistics found.")
+if total_bytes == 0:
+    raise RuntimeError("No programming language data found.")
 
-# Generate Markdown
+# 3. Generate language table
 lines = [
-    "## Most Used Languages",
-    "",
     "| Language | Usage |",
     "|---|---:|"
 ]
 
-for language, size in sorted_languages[:10]:
+for language, size in sorted(
+    totals.items(),
+    key=lambda item: item[1],
+    reverse=True
+)[:10]:
     percentage = size / total_bytes * 100
     lines.append(f"| {language} | {percentage:.2f}% |")
 
 new_section = "\n".join(lines)
 
-# Update README between markers
-with open("README.md", "r", encoding="utf-8") as file:
-    readme = file.read()
+# 4. Fetch your actual public profile README
+readme_url = (
+    f"{API}/repos/{USERNAME}/{PROFILE_REPO}"
+    "/contents/README.md"
+)
+
+readme_data = request(readme_url, WRITE_TOKEN)
+
+readme = base64.b64decode(
+    readme_data["content"]
+).decode("utf-8")
 
 start = "<!-- LANGUAGES-START -->"
 end = "<!-- LANGUAGES-END -->"
 
 if start not in readme or end not in readme:
-    raise RuntimeError("Language markers missing in README.")
+    raise RuntimeError("Language markers missing in profile README.")
 
-before, remainder = readme.split(start, 1)
-_, after = remainder.split(end, 1)
+before, remaining = readme.split(start, 1)
+_, after = remaining.split(end, 1)
 
-updated = (
-    before
-    + start
-    + "\n"
-    + new_section
-    + "\n"
-    + end
-    + after
+updated_readme = (
+    before + start + "\n"
+    + new_section + "\n"
+    + end + after
 )
 
-with open("README.md", "w", encoding="utf-8") as file:
-    file.write(updated)
+# 5. Update profile README through GitHub API
+request(
+    readme_url,
+    WRITE_TOKEN,
+    method="PUT",
+    data={
+        "message": "Update private and public language statistics",
+        "content": base64.b64encode(
+            updated_readme.encode("utf-8")
+        ).decode("ascii"),
+        "sha": readme_data["sha"]
+    }
+)
 
-print("Language statistics updated successfully.")
+print("Successfully updated GitHub profile!")
+print(f"Repositories checked: {len(repositories)}")
+print(f"Languages found: {len(totals)}")
